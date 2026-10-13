@@ -53,7 +53,7 @@ type model struct {
 	height     int
 	player     *player
 	tts        *ttsClient
-	pdfPath    string
+	filePath    string
 	status     int
 	errMsg     string
 	gPressed   bool
@@ -183,11 +183,11 @@ type (
 	loadedMsg struct{ chunks []chunkInfo }
 )
 
-func initialModel(pdfPath string) model {
+func initialModel(filePath string) model {
 	// Fallback size in case the terminal never reports its dimensions
 	// (e.g. when run under `script` or other minimal ptys).
 	return model{
-		pdfPath:    pdfPath,
+		filePath:    filePath,
 		status:     statusIdle,
 		width:      80,
 		height:     24,
@@ -197,15 +197,15 @@ func initialModel(pdfPath string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadPDF(m.pdfPath), tickCmd())
+	return tea.Batch(loadDoc(m.filePath), tickCmd())
 }
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-// loadPDF extracts text and kicks off synthesis of the first chunk.
-func loadPDF(path string) tea.Cmd {
+// loadDoc extracts text and warms the cache around the first chunk.
+func loadDoc(path string) tea.Cmd {
 	return func() tea.Msg {
 		pages, err := extractText(path)
 		if err != nil {
@@ -473,7 +473,7 @@ func (m model) View() string {
 }
 
 func (m model) statusLine() string {
-	title := titleStyle.Render(filepath.Base(m.pdfPath))
+	title := titleStyle.Render(filepath.Base(m.filePath))
 	if len(m.chunks) == 0 {
 		if m.status == statusError {
 			return title + "  " + errorStyle.Render("✗ "+m.errMsg)
@@ -640,7 +640,7 @@ func wrapText(text string, width int) []string {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: reader <pdf文件路径>\n")
+		fmt.Fprintf(os.Stderr, "用法: reader <pdf/txt/md/docx/odt/epub 文件路径>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -648,9 +648,13 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	pdfPath := flag.Arg(0)
-	if _, err := os.Stat(pdfPath); err != nil {
-		fmt.Fprintf(os.Stderr, "无法读取 %s: %v\n", pdfPath, err)
+	filePath := flag.Arg(0)
+	if _, err := os.Stat(filePath); err != nil {
+		fmt.Fprintf(os.Stderr, "无法读取 %s: %v\n", filePath, err)
+		os.Exit(1)
+	}
+	if ext := strings.ToLower(filepath.Ext(filePath)); !supportedExtensions[ext] {
+		fmt.Fprintf(os.Stderr, "不支持的文件类型 %s（支持 pdf/txt/md/docx/odt/epub；.doc/.rtf 请先另存为 docx）\n", ext)
 		os.Exit(1)
 	}
 
@@ -662,7 +666,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := initialModel(pdfPath)
+	m := initialModel(filePath)
 	m.tts = newTTSClient(cacheDir)
 
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
