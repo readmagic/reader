@@ -1,4 +1,4 @@
-module pdftts
+module reader
 
 go 1.26.5
 

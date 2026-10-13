@@ -1,4 +1,6 @@
 # Compiled binary
+reader
+reader-*
 pdftts
 pdftts-*
 *.exe

@@ -640,7 +640,7 @@ func wrapText(text string, width int) []string {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: pdftts <pdf文件路径>\n")
+		fmt.Fprintf(os.Stderr, "用法: reader <pdf文件路径>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -656,7 +656,7 @@ func main() {
 
 	// New endpoint = new voice signature; partition the cache so we
 	// never play stale mp3s from the previous text-to-speech.cn backend.
-	cacheDir := filepath.Join(os.TempDir(), "pdftts-edge-cache")
+	cacheDir := filepath.Join(os.TempDir(), "reader-tts-cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "创建缓存目录失败: %v\n", err)
 		os.Exit(1)
