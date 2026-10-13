@@ -404,39 +404,151 @@ func stripHTML(data []byte) string {
 	return html.UnescapeString(sb.String())
 }
 
-// splitChunks breaks text into sentence-level chunks for TTS.
-// Every line (from the document's own line breaks: titles, list items,
-// soft-wrapped lines) forms its own chunk group; inside a line, every
-// sentence-final punctuation (。！？…；plus ASCII equivalents) starts a
-// new chunk. Overly long sentences are hard-split as a fallback.
+// 中文标点按语义分三层：先按句末切分，块仍超长才降到句中标点，
+// 再超长才降到短停顿，最后按宽度兜底。这样短句里的分号/逗号
+// 不会被无谓地切碎，只有真正长到不好念的句子才会换气。
+const (
+	levelSentence = iota + 1 // 句末：。！？… 和 ASCII .!?
+	levelClause              // 句中较大停顿：；： 和 ASCII ;:
+	levelPhrase              // 句中短停顿：，、 和 ASCII ,
+)
+
+var endingsByLevel = [][]rune{
+	levelSentence: {'。', '！', '？', '…', '.', '!', '?'},
+	levelClause:   {'；', '：', ';', ':'},
+	levelPhrase:   {'，', '、', ','},
+}
+
+// splitChunks breaks text into TTS chunks. Each paragraph is one chunk;
+// only when a paragraph exceeds maxRunes do we descend into the
+// hierarchical punctuation split. Soft newlines inside a paragraph are
+// folded into spaces so a source-line wrap does not fragment the chunk.
 func splitChunks(text string, maxRunes int) []string {
 	if maxRunes <= 0 {
 		maxRunes = 450
 	}
 	var chunks []string
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		for _, sentence := range splitSentences(line) {
-			if utf8.RuneCountInString(sentence) > maxRunes {
-				chunks = append(chunks, hardSplit(sentence, maxRunes)...)
-				continue
-			}
-			chunks = append(chunks, sentence)
+	for _, para := range splitParagraphs(text) {
+		if utf8.RuneCountInString(para) > maxRunes {
+			chunks = append(chunks, splitAtLevel(para, levelSentence, maxRunes)...)
+		} else {
+			chunks = append(chunks, para)
 		}
 	}
 	return chunks
 }
 
-// splitSentences cuts a line on EVERY sentence-final punctuation —
-// short sentences become their own chunks too — and attaches trailing
-// closing quotes/brackets so quoted sentences stay together. A '.' that
-// sits between digits (3.14) is a decimal point, not a sentence end.
+// splitParagraphs splits text into paragraphs. A blank line always ends
+// the paragraph; otherwise a line whose last rune is a sentence-final
+// mark (。！？… .!?) also ends it. Other newlines are soft wraps and get
+// folded into the paragraph as spaces, so pdftotext's hard-wrapped lines
+// stay in the same chunk.
+func splitParagraphs(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	var paras []string
+	var cur strings.Builder
+	flush := func() {
+		if s := squeezeCJKSpaces(strings.TrimSpace(cur.String())); s != "" {
+			paras = append(paras, s)
+		}
+		cur.Reset()
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		if cur.Len() > 0 {
+			cur.WriteByte(' ')
+		}
+		cur.WriteString(strings.TrimSpace(line))
+		if endsSentence(cur.String()) {
+			flush()
+		}
+	}
+	flush()
+	return paras
+}
+
+// squeezeCJKSpaces removes spaces adjacent to CJK runes. pdftotext pads
+// Chinese lines with alignment spaces and splitParagraphs folds soft
+// newlines into spaces, leaving gaps like 战 略 that mean nothing to a
+// TTS engine. Spaces whose both neighbors are Latin are kept so English
+// still segments into words.
+func squeezeCJKSpaces(s string) string {
+	runes := []rune(s)
+	var out []rune
+	for i := 0; i < len(runes); i++ {
+		if !unicode.IsSpace(runes[i]) {
+			out = append(out, runes[i])
+			continue
+		}
+		j := i + 1
+		for j < len(runes) && unicode.IsSpace(runes[j]) {
+			j++
+		}
+		if (i > 0 && isCJK(runes[i-1])) || (j < len(runes) && isCJK(runes[j])) {
+			i = j - 1
+			continue
+		}
+		out = append(out, ' ') // collapse, e.g. "word    wrap" -> "word wrap"
+		i = j - 1
+	}
+	return string(out)
+}
+
+// isCJK reports whether r is a CJK rune: Han characters, CJK/fullwidth
+// punctuation, curly quotes, em dashes and ellipses — the runes next to
+// which a space is layout noise rather than a word boundary.
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) ||
+		(r >= 0x3000 && r <= 0x303F) || // CJK symbols & punct: 、。「」
+		(r >= 0xFF01 && r <= 0xFF64) || // fullwidth: ，！？（）
+		(r >= 0x2018 && r <= 0x201D) || // curly quotes ‘’“”
+		r == '—' || r == '…' // ——、……
+}
+
+// endsSentence reports whether the last rune of s is a sentence-final
+// mark — the same set splitOnEndings treats as level-1 boundaries.
+func endsSentence(s string) bool {
+	r := []rune(s)
+	if len(r) == 0 {
+		return false
+	}
+	switch r[len(r)-1] {
+	case '。', '！', '？', '…', '.', '!', '?':
+		return true
+	}
+	return false
+}
+
+// splitAtLevel segments s on the given level's punctuation. Any part that
+// still exceeds maxRunes is recursed into the next level; past the last
+// level we fall back to a width-based hard split.
+func splitAtLevel(s string, level, maxRunes int) []string {
+	if level > levelPhrase {
+		return splitByWidth(s, maxRunes)
+	}
+	var out []string
+	for _, part := range splitOnEndings(s, endingsByLevel[level]) {
+		if utf8.RuneCountInString(part) > maxRunes {
+			out = append(out, splitAtLevel(part, level+1, maxRunes)...)
+		} else {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// splitOnEndings cuts a line on every rune in endings, attaching any
+// trailing closing quotes/brackets so quoted sentences stay together. A
+// '.' between two digits (3.14) is a decimal point, not a sentence end.
 // Punctuation-only results are dropped: they would synthesize silence.
-func splitSentences(line string) []string {
-	endings := map[rune]bool{'。': true, '！': true, '？': true, '；': true, '…': true, '.': true, '!': true, '?': true, ';': true}
+func splitOnEndings(line string, endings []rune) []string {
+	endingsSet := make(map[rune]bool, len(endings))
+	for _, r := range endings {
+		endingsSet[r] = true
+	}
 	closing := map[rune]bool{'"': true, '\'': true, '”': true, '’': true, '」': true, '』': true, '）': true, ')': true}
 
 	runes := []rune(line)
@@ -449,7 +561,7 @@ func splitSentences(line string) []string {
 			continue // decimal point, not a sentence end
 		}
 		cur = append(cur, runes[i])
-		if !endings[runes[i]] {
+		if !endingsSet[runes[i]] {
 			continue
 		}
 		// attach trailing closing quotes: “……。”) stays with the sentence
@@ -468,6 +580,23 @@ func splitSentences(line string) []string {
 	return parts
 }
 
+// splitByWidth is the final fallback: cut a punctuation-free (or
+// otherwise unsplittable) string into maxRunes-wide pieces.
+func splitByWidth(s string, maxRunes int) []string {
+	runes := []rune(s)
+	var out []string
+	for i := 0; i < len(runes); i += maxRunes {
+		end := i + maxRunes
+		if end > len(runes) {
+			end = len(runes)
+		}
+		if seg := strings.TrimSpace(string(runes[i:end])); seg != "" {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
+
 // hasContent reports whether s contains anything besides punctuation and
 // whitespace.
 func hasContent(s string) bool {
@@ -477,29 +606,6 @@ func hasContent(s string) bool {
 		}
 	}
 	return false
-}
-
-// hardSplit cuts a single long sentence on commas, then by width.
-func hardSplit(s string, maxRunes int) []string {
-	var out []string
-	runes := []rune(s)
-	var cur []rune
-	flush := func() {
-		if len(cur) > 0 {
-			out = append(out, strings.TrimSpace(string(cur)))
-			cur = cur[:0]
-		}
-	}
-	for _, r := range runes {
-		cur = append(cur, r)
-		if (r == '，' || r == ',' || r == '、') && len(cur) >= maxRunes/2 {
-			flush()
-		} else if len(cur) >= maxRunes {
-			flush()
-		}
-	}
-	flush()
-	return out
 }
 
 // chunkInfo carries chunk text plus which source page it came from.
