@@ -1,0 +1,23 @@
+# Compiled binary
+pdftts
+pdftts-*
+*.exe
+
+# Test artifacts
+*.out
+*.test
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db
