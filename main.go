@@ -39,25 +39,25 @@ var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
 	pageStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	currentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
-	doneStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))  // 已读段：淡灰
-	normalStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))  // 未读段：正常
+	doneStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241")) // 已读段：淡灰
+	normalStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252")) // 未读段：正常
 	hintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	fetchingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 type model struct {
-	chunks     []chunkInfo
-	current    int
-	width      int
-	height     int
-	player     *player
-	tts        *ttsClient
-	filePath    string
-	status     int
-	errMsg     string
-	gPressed   bool
-	pageInput  string
+	chunks    []chunkInfo
+	current   int
+	width     int
+	height    int
+	player    *player
+	tts       *ttsClient
+	filePath  string
+	status    int
+	errMsg    string
+	gPressed  bool
+	pageInput string
 	// started flips true on the first Enter and stays true: before that
 	// the app is silent (browsing mode) and fetched audio is only stashed.
 	started bool
@@ -67,6 +67,15 @@ type model struct {
 	// pending tracks chunk indexes whose fetch is already in flight so
 	// ensureFetch is idempotent under concurrent prefetch.
 	pending map[int]bool
+	// progress persists reading positions between sessions; nil disables
+	// resume (tests, or an unusable config location).
+	progress *progressStore
+	// resumed flags that this open restored a saved position; it shows a
+	// notice in the status line until the first key press clears it.
+	resumed bool
+	// docTitle names the document in the status line once known (a web
+	// page's <title>); empty falls back to the file name.
+	docTitle string
 }
 
 // moveCursor stops playback, moves the cursor to newIdx (clamped), and
@@ -84,6 +93,9 @@ func moveCursor(m model, newIdx int) (model, tea.Cmd) {
 		newIdx = len(m.chunks) - 1
 	}
 	m.current = newIdx
+	// Persist on every move so a crash mid-session still resumes close
+	// to where reading stopped.
+	m.saveProgress()
 	if m.started {
 		m.status = statusFetching
 		return playOrFetch(m, m.current)
@@ -180,14 +192,17 @@ type (
 		path string
 		err  error
 	}
-	loadedMsg struct{ chunks []chunkInfo }
+	loadedMsg struct {
+		chunks []chunkInfo
+		title  string
+	}
 )
 
 func initialModel(filePath string) model {
 	// Fallback size in case the terminal never reports its dimensions
 	// (e.g. when run under `script` or other minimal ptys).
 	return model{
-		filePath:    filePath,
+		filePath:   filePath,
 		status:     statusIdle,
 		width:      80,
 		height:     24,
@@ -204,18 +219,19 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-// loadDoc extracts text and warms the cache around the first chunk.
+// loadDoc extracts text (from a local file or a web address) and warms
+// the cache around the first chunk.
 func loadDoc(path string) tea.Cmd {
 	return func() tea.Msg {
-		pages, err := extractText(path)
+		pages, title, err := extractDocument(path)
 		if err != nil {
 			return errMsgT{err: err.Error()}
 		}
 		chunks := buildChunks(pages, chunkMaxRunes)
 		if len(chunks) == 0 {
-			return errMsgT{err: "no readable text found in PDF"}
+			return errMsgT{err: "未找到可朗读的文本"}
 		}
-		return loadedMsg{chunks: chunks}
+		return loadedMsg{chunks: chunks, title: title}
 	}
 }
 
@@ -229,11 +245,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case loadedMsg:
 		m.chunks = msg.chunks
+		m.docTitle = msg.title
 		m.current = 0
+		// Resume at the saved position if it still points inside the
+		// document; a truncated or replaced file just falls through to
+		// the top. Current == 0 is the top already, so no notice.
+		if p, ok := m.savedProgress(); ok && p.Current > 0 && p.Current < len(m.chunks) {
+			m.current = p.Current
+			m.resumed = true
+		}
 		m.status = statusIdle
 		// Stay silent: warm the cache around the cursor so the first
 		// Enter starts instantly, but do not auto-play.
-		return m, prefetchAround(m, 0)
+		return m, prefetchAround(m, m.current)
 
 	case fetchedMsg:
 		delete(m.pending, msg.idx)
@@ -270,6 +294,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.current+1 < len(m.chunks) {
 			m.current++
+			m.saveProgress()
 			m.status = statusFetching
 			return playOrFetch(m, m.current)
 		}
@@ -291,6 +316,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Any key acknowledges the resume notice.
+	m.resumed = false
+
 	// Page-input mode intercepts everything except Enter/Esc/Backspace.
 	if m.pageInput != "" {
 		switch msg.String() {
@@ -343,6 +371,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.player != nil {
 			m.player.stop()
 		}
+		m.saveProgress()
 		return m, tea.Quit
 
 	case "enter":
@@ -371,7 +400,7 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n", "l", "right", "j", "down":
 		if m.current < len(m.chunks)-1 {
-			return moveCursor(m, m.current + 1)
+			return moveCursor(m, m.current+1)
 		}
 
 	case "b", "h", "left", "k", "up":
@@ -473,7 +502,7 @@ func (m model) View() string {
 }
 
 func (m model) statusLine() string {
-	title := titleStyle.Render(filepath.Base(m.filePath))
+	title := titleStyle.Render(m.docName())
 	if len(m.chunks) == 0 {
 		if m.status == statusError {
 			return title + "  " + errorStyle.Render("✗ "+m.errMsg)
@@ -497,7 +526,31 @@ func (m model) statusLine() string {
 	}
 	page := pageStyle.Render(fmt.Sprintf("第 %d 页", m.chunks[m.current].Page))
 	progress := pageStyle.Render(fmt.Sprintf("[%d/%d]", m.current+1, len(m.chunks)))
-	return fmt.Sprintf("%s  %s  %s  %s", title, st, page, progress)
+	line := fmt.Sprintf("%s  %s  %s  %s", title, st, page, progress)
+	if m.resumed {
+		line += "  " + fetchingStyle.Render("↩ 已恢复上次位置")
+	}
+	return line
+}
+
+// docName is what the status line calls the document: the web page
+// title when known, otherwise the file name; truncated so long titles
+// cannot push the status fields off screen.
+func (m model) docName() string {
+	name := m.docTitle
+	if name == "" {
+		name = filepath.Base(m.filePath)
+	}
+	return truncateWide(name, 48)
+}
+
+// truncateWide shortens s to max display columns, appending an
+// ellipsis when it had to cut.
+func truncateWide(s string, max int) string {
+	if runewidth.StringWidth(s) <= max {
+		return s
+	}
+	return runewidth.Truncate(s, max, "…")
 }
 
 // readingView renders the FULL PAGE the current chunk belongs to:
@@ -640,7 +693,7 @@ func wrapText(text string, width int) []string {
 
 func main() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "用法: reader <pdf/txt/md/docx/odt/epub 文件路径>\n")
+		fmt.Fprintf(os.Stderr, "用法: reader <pdf/txt/md/docx/odt/epub 文件路径 或 http(s) 网页地址>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -649,13 +702,17 @@ func main() {
 		os.Exit(1)
 	}
 	filePath := flag.Arg(0)
-	if _, err := os.Stat(filePath); err != nil {
-		fmt.Fprintf(os.Stderr, "无法读取 %s: %v\n", filePath, err)
-		os.Exit(1)
-	}
-	if ext := strings.ToLower(filepath.Ext(filePath)); !supportedExtensions[ext] {
-		fmt.Fprintf(os.Stderr, "不支持的文件类型 %s（支持 pdf/txt/md/docx/odt/epub；.doc/.rtf 请先另存为 docx）\n", ext)
-		os.Exit(1)
+	if !isURL(filePath) {
+		// A web address has nothing to stat or validate locally; the
+		// fetch and extraction happen inside loadDoc.
+		if _, err := os.Stat(filePath); err != nil {
+			fmt.Fprintf(os.Stderr, "无法读取 %s: %v\n", filePath, err)
+			os.Exit(1)
+		}
+		if ext := strings.ToLower(filepath.Ext(filePath)); !supportedExtensions[ext] {
+			fmt.Fprintf(os.Stderr, "不支持的文件类型 %s（支持 pdf/txt/md/docx/odt/epub；.doc/.rtf 请先另存为 docx）\n", ext)
+			os.Exit(1)
+		}
 	}
 
 	// New endpoint = new voice signature; partition the cache so we
@@ -666,8 +723,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Progress is keyed by absolute path so re-opening the same document
+	// from a different working directory still resumes to the same spot.
+	// URLs stay as-is: filepath.Abs would mangle one into a bogus local
+	// path.
+	if !isURL(filePath) {
+		if abs, err := filepath.Abs(filePath); err == nil {
+			filePath = abs
+		}
+	}
+
 	m := initialModel(filePath)
 	m.tts = newTTSClient(cacheDir)
+	m.progress = newProgressStore()
 
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "运行出错: %v\n", err)
